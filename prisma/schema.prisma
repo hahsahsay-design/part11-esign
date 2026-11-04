@@ -1,0 +1,926 @@
+// Part 11 Electronic Signature Platform — core data model.
+// Multi-tenant: every org-scoped model carries organizationId and is indexed on it.
+// Tenant isolation is enforced again at the application layer (see src/lib/tenant.ts) —
+// this schema does not rely on Postgres RLS for isolation in Phase 1 (see docs/limitations.md).
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Organizations & tenancy
+// ─────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  status    OrgStatus @default(ACTIVE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branding      OrganizationBranding?
+  securityPolicy OrganizationSecurityPolicy?
+
+  memberships       OrganizationMembership[]
+  departments       Department[]
+  documents         Document[]
+  documentFolders   DocumentFolder[]
+  signatureRequests SignatureRequest[]
+  signatureMeanings SignatureMeaning[]
+  auditEvents       AuditEvent[]
+  authEvents        AuthenticationEvent[]
+  retentionPolicies RetentionPolicy[]
+  legalHolds        LegalHold[]
+  trainingRecords   TrainingRecord[]
+  complianceReports ComplianceReport[]
+  notificationPrefs NotificationPreference[]
+  emailLogs         EmailLog[]
+  subscription      Subscription?
+  billingRecords    BillingRecord[]
+  membershipPermissions MembershipPermission[]
+  invites           OrgInvite[]
+
+  @@index([status])
+}
+
+enum OrgStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+model OrganizationBranding {
+  id             String   @id @default(uuid())
+  organizationId String   @unique
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  logoUrl        String?
+  primaryColor   String?  @default("#1E2A5A")
+  supportEmail   String?
+  updatedAt      DateTime @updatedAt
+}
+
+// Configurable security controls — 21 CFR 11.300 password/lockout policy, MFA policy.
+model OrganizationSecurityPolicy {
+  id             String   @id @default(uuid())
+  organizationId String   @unique
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  passwordMinLength       Int     @default(12)
+  passwordRequireUpper    Boolean @default(true)
+  passwordRequireLower    Boolean @default(true)
+  passwordRequireNumber   Boolean @default(true)
+  passwordRequireSymbol   Boolean @default(true)
+  passwordHistoryCount    Int     @default(6)   // cannot reuse last N passwords
+  passwordExpiryDays      Int?    @default(90)  // null = never expires
+  maxFailedLoginAttempts  Int     @default(5)
+  lockoutDurationMinutes  Int     @default(30)
+  sessionIdleTimeoutMinutes Int   @default(15)
+  sessionAbsoluteTimeoutHours Int @default(12)
+  mfaRequired             Boolean @default(true)
+  reauthForSigningRequired Boolean @default(true)
+
+  updatedAt DateTime @updatedAt
+  updatedBy String?
+}
+
+model Department {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  createdAt      DateTime @default(now())
+
+  memberships OrganizationMembership[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Users & identity — a signing identity is global and is never reassigned.
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id                 String    @id @default(uuid())
+  email              String    @unique
+  emailVerifiedAt    DateTime?
+  fullName           String
+  passwordHash       String?
+  status             UserStatus @default(PENDING_VERIFICATION)
+  failedLoginCount   Int       @default(0)
+  lockedUntil        DateTime?
+  passwordChangedAt  DateTime?
+  mustChangePassword Boolean   @default(false)
+  deactivatedAt      DateTime?
+  deactivatedReason  String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  memberships        OrganizationMembership[]
+  mfaFactors         MfaFactor[]
+  sessions           UserSession[]
+  verificationTokens VerificationToken[]
+  passwordHistory    PasswordHistory[]
+  authEvents         AuthenticationEvent[]
+  auditEvents        AuditEvent[]
+  documentsCreated   DocumentVersion[]       @relation("DocumentVersionCreatedBy")
+  signaturesGiven    ElectronicSignature[]
+  trainingRecords    TrainingRecord[]
+  complianceReportsGenerated ComplianceReport[]
+
+  @@index([status])
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  DEACTIVATED
+}
+
+// Role is the coarse, system-defined grant. Fine-grained overrides live in
+// MembershipPermission. Keeping role as an enum (rather than a per-org table)
+// keeps default permissions auditable in code; see src/lib/permissions.ts.
+enum Role {
+  ORG_OWNER
+  ORG_ADMIN
+  QA_MANAGER
+  QC_MANAGER
+  DOCUMENT_ADMIN
+  STANDARD_USER
+  EXTERNAL_SIGNER
+  READ_ONLY_AUDITOR
+}
+
+model OrganizationMembership {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  departmentId   String?
+  department     Department? @relation(fields: [departmentId], references: [id])
+
+  role           Role
+  status         MembershipStatus @default(ACTIVE)
+  title          String?
+  invitedBy      String?
+  invitedAt      DateTime  @default(now())
+  joinedAt       DateTime?
+  deactivatedAt  DateTime?
+
+  permissionOverrides MembershipPermission[]
+
+  @@unique([organizationId, userId])
+  @@index([organizationId, role])
+  @@index([userId])
+}
+
+enum MembershipStatus {
+  ACTIVE
+  INVITED
+  DEACTIVATED
+}
+
+// A pending invitation to join an organization. Distinct from
+// VerificationToken (email verify / password reset) because an invite
+// targets an email that may not have a User row yet, and carries the role/
+// department the invite grants on acceptance.
+model OrgInvite {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email          String
+  fullName       String
+  role           Role
+  departmentId   String?
+  tokenHash      String   @unique
+  invitedById    String
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId])
+  @@index([email])
+}
+
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique // e.g. "documents.delete", "audit.export"
+  category    String
+  description String
+
+  overrides MembershipPermission[]
+}
+
+model MembershipPermission {
+  id             String   @id @default(uuid())
+  membershipId   String
+  membership     OrganizationMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  permissionId   String
+  permission     Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  granted        Boolean  // true = explicit grant, false = explicit revoke (overrides role default)
+  grantedBy      String?
+  grantedAt      DateTime @default(now())
+
+  @@unique([membershipId, permissionId])
+  @@index([organizationId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Authentication, sessions, MFA — 21 CFR 11.200 / 11.300
+// ─────────────────────────────────────────────────────────────────────────
+
+model MfaFactor {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        MfaType
+  secretCiphertext String? // AES-256-GCM encrypted TOTP secret (must be reversible to verify codes)
+  backupCodesHash  String? // JSON array of bcrypt hashes — never need the originals back
+  verifiedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  disabledAt  DateTime?
+
+  @@index([userId])
+}
+
+enum MfaType {
+  TOTP
+  BACKUP_CODES
+}
+
+model UserSession {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?  // active org context for this session
+  tokenHash      String   @unique
+  ipAddress      String?
+  userAgent      String?
+  mfaVerified    Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  lastSeenAt     DateTime @default(now())
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  revokedReason  String?
+
+  @@index([userId])
+  @@index([tokenHash])
+}
+
+model VerificationToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose   VerificationPurpose
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, purpose])
+}
+
+enum VerificationPurpose {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+model PasswordHistory {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+model AuthenticationEvent {
+  id             String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  userId         String?
+  user           User?    @relation(fields: [userId], references: [id])
+  type           AuthEventType
+  success        Boolean
+  ipAddress      String?
+  userAgent      String?
+  sessionId      String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  signatures ElectronicSignature[]
+
+  @@index([organizationId])
+  @@index([userId, type])
+  @@index([createdAt])
+}
+
+enum AuthEventType {
+  LOGIN
+  LOGOUT
+  MFA_CHALLENGE
+  MFA_ENROLL
+  PASSWORD_RESET_REQUEST
+  PASSWORD_RESET_COMPLETE
+  PASSWORD_CHANGE
+  ACCOUNT_LOCKOUT
+  REAUTH_FOR_SIGNING
+  EMAIL_VERIFICATION
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Documents
+// ─────────────────────────────────────────────────────────────────────────
+
+model DocumentFolder {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  parentId       String?
+  parent         DocumentFolder? @relation("FolderTree", fields: [parentId], references: [id])
+  children       DocumentFolder[] @relation("FolderTree")
+  createdAt      DateTime @default(now())
+
+  documents Document[]
+
+  @@index([organizationId])
+}
+
+model Document {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  folderId       String?
+  folder         DocumentFolder? @relation(fields: [folderId], references: [id])
+  title          String
+  status         DocumentStatus @default(DRAFT)
+  createdById    String
+  archivedAt     DateTime?
+  legalHoldId    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  versions          DocumentVersion[]
+  signatureRequests SignatureRequest[]
+  auditEvents       AuditEvent[]
+  legalHold         LegalHold? @relation(fields: [legalHoldId], references: [id])
+
+  @@index([organizationId, status])
+  @@index([folderId])
+}
+
+enum DocumentStatus {
+  DRAFT
+  OUT_FOR_SIGNATURE
+  COMPLETED
+  DECLINED
+  VOIDED
+  EXPIRED
+  ARCHIVED
+}
+
+// Every upload, and every finalized signed record, is its own immutable version.
+// The original (version 1) is never overwritten.
+model DocumentVersion {
+  id               String   @id @default(uuid())
+  documentId       String
+  document         Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  versionNumber    Int
+  kind             DocumentVersionKind @default(ORIGINAL)
+  originalFileName String
+  storageKey       String   // path/key in object storage
+  mimeType         String   @default("application/pdf")
+  fileSizeBytes    Int
+  sha256Hash       String
+  pageCount        Int?
+  createdById      String
+  createdBy        User     @relation("DocumentVersionCreatedBy", fields: [createdById], references: [id])
+  createdAt        DateTime @default(now())
+
+  signatureRequests SignatureRequest[] @relation("SourceVersion")
+  finalizedFor      SignatureRequest[] @relation("FinalVersion")
+  signatureFields   SignatureField[]
+  signatures        ElectronicSignature[]
+
+  @@unique([documentId, versionNumber])
+  @@index([documentId])
+}
+
+enum DocumentVersionKind {
+  ORIGINAL
+  SIGNED_RECORD
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Signature workflows
+// ─────────────────────────────────────────────────────────────────────────
+
+// Admin-configurable catalog of permitted signature meanings (11.50).
+model SignatureMeaning {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  label          String   // "Approved by", "Reviewed by", ...
+  code           String   // machine key: APPROVED, REVIEWED, SIGNED, VERIFIED, AUTHORED, WITNESSED
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  fields     SignatureField[]
+  signatures ElectronicSignature[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+}
+
+model SignatureRequest {
+  id                String   @id @default(uuid())
+  organizationId    String
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  documentId        String
+  document          Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  sourceVersionId   String
+  sourceVersion     DocumentVersion @relation("SourceVersion", fields: [sourceVersionId], references: [id])
+  finalVersionId    String?
+  finalVersion      DocumentVersion? @relation("FinalVersion", fields: [finalVersionId], references: [id])
+
+  title             String
+  instructions      String?
+  signingMode       SigningMode @default(SEQUENTIAL)
+  status            SignatureRequestStatus @default(DRAFT)
+  createdById       String
+  sentAt            DateTime?
+  expiresAt         DateTime?
+  completedAt       DateTime?
+  declinedAt        DateTime?
+  declinedReason    String?
+  voidedAt          DateTime?
+  voidedReason      String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  recipients SignatureRequestRecipient[]
+  fields     SignatureField[]
+  signatures ElectronicSignature[]
+  auditEvents AuditEvent[]
+
+  @@index([organizationId, status])
+  @@index([documentId])
+}
+
+enum SigningMode {
+  SEQUENTIAL
+  PARALLEL
+}
+
+enum SignatureRequestStatus {
+  DRAFT
+  SENT
+  IN_PROGRESS
+  COMPLETED
+  DECLINED
+  VOIDED
+  EXPIRED
+}
+
+model SignatureRequestRecipient {
+  id                 String   @id @default(uuid())
+  signatureRequestId String
+  signatureRequest   SignatureRequest @relation(fields: [signatureRequestId], references: [id], onDelete: Cascade)
+  userId             String?  // set when the recipient is an internal platform user
+  email              String
+  fullName           String
+  recipientRole      RecipientRole @default(SIGNER)
+  signingOrder        Int      @default(1)
+  status             RecipientStatus @default(PENDING)
+  accessTokenHash    String   @unique
+  tokenExpiresAt     DateTime
+  viewedAt           DateTime?
+  completedAt        DateTime?
+  declinedAt         DateTime?
+  declineReason      String?
+  createdAt          DateTime @default(now())
+
+  // Second authentication factor for the signing session, set by the
+  // recipient on first visiting their link. Paired with possession of the
+  // emailed access token this gives two distinct identification components
+  // (21 CFR 11.200(a)(1)) for recipients who have no platform account; an
+  // internal platform user instead reauthenticates with their normal account
+  // password. Re-checked at the moment of signing, never cached client-side.
+  signingPasswordHash String?
+
+  fields     SignatureField[]
+  signatures ElectronicSignature[]
+  fieldResponses FieldResponse[]
+
+  @@index([signatureRequestId])
+  @@index([email])
+}
+
+enum RecipientRole {
+  SIGNER
+  APPROVER
+  CC
+  WITNESS
+}
+
+enum RecipientStatus {
+  PENDING
+  SENT
+  VIEWED
+  COMPLETED
+  DECLINED
+}
+
+model SignatureField {
+  id                 String   @id @default(uuid())
+  signatureRequestId String
+  signatureRequest   SignatureRequest @relation(fields: [signatureRequestId], references: [id], onDelete: Cascade)
+  documentVersionId  String
+  documentVersion    DocumentVersion @relation(fields: [documentVersionId], references: [id])
+  recipientId        String
+  recipient          SignatureRequestRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+
+  type       FieldType
+  page       Int
+  xPct       Float     // position as % of page width/height, so it is resolution independent
+  yPct       Float
+  widthPct   Float
+  heightPct  Float
+  required   Boolean   @default(true)
+  label      String?
+  defaultMeaningId String?
+  defaultMeaning   SignatureMeaning? @relation(fields: [defaultMeaningId], references: [id])
+
+  signature  ElectronicSignature?
+  response   FieldResponse?
+
+  @@index([signatureRequestId])
+  @@index([recipientId])
+}
+
+enum FieldType {
+  SIGNATURE
+  INITIALS
+  DATE
+  TEXT
+  CHECKBOX
+}
+
+// Non-signature field values (text/date/checkbox) — kept distinct from the
+// electronic signature record itself.
+model FieldResponse {
+  id          String   @id @default(uuid())
+  fieldId     String   @unique
+  field       SignatureField @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+  recipientId String
+  recipient   SignatureRequestRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  value       String
+  submittedAt DateTime @default(now())
+}
+
+// The electronic signature itself — 21 CFR 11.50 / 11.70.
+// One row per completed SIGNATURE/INITIALS field. Cryptographically bound to
+// the exact document version hash that was on screen at signing time.
+model ElectronicSignature {
+  id                    String   @id @default(uuid())
+  signatureRequestId    String
+  signatureRequest      SignatureRequest @relation(fields: [signatureRequestId], references: [id], onDelete: Cascade)
+  fieldId               String   @unique
+  field                 SignatureField @relation(fields: [fieldId], references: [id])
+  recipientId           String
+  recipient             SignatureRequestRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  documentVersionId     String
+  documentVersion       DocumentVersion @relation(fields: [documentVersionId], references: [id])
+
+  signerUserId          String?  // null for an external, non-platform signer
+  signerUser             User?   @relation(fields: [signerUserId], references: [id])
+  printedName           String   // name as attributable at the moment of signing — never edited after
+  meaningId             String
+  meaning               SignatureMeaning @relation(fields: [meaningId], references: [id])
+
+  authenticationEventId String
+  authenticationEvent   AuthenticationEvent @relation(fields: [authenticationEventId], references: [id])
+
+  signedAtUtc           DateTime @default(now())
+  ipAddress             String?
+  userAgent             String?
+
+  // Binding: sha256(documentVersion.sha256Hash + fieldId + recipientId + meaningId + signedAtUtc + signerUserId)
+  // signed with the platform's signing key. Detects the signature being copied
+  // onto another record or the record being altered after signing.
+  documentHashAtSigning String
+  integritySignature    String
+
+  createdAt DateTime @default(now())
+
+  @@index([signatureRequestId])
+  @@index([documentVersionId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Immutable audit trail
+// ─────────────────────────────────────────────────────────────────────────
+
+model AuditEvent {
+  id             String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  userId         String?
+  user           User?    @relation(fields: [userId], references: [id])
+  documentId     String?
+  document       Document? @relation(fields: [documentId], references: [id])
+  signatureRequestId String?
+  signatureRequest   SignatureRequest? @relation(fields: [signatureRequestId], references: [id])
+
+  eventType      AuditEventType
+  description    String
+  ipAddress      String?
+  sessionId      String?
+  previousValue  Json?
+  newValue       Json?
+  metadata       Json?
+
+  timestampUtc   DateTime @default(now())
+
+  // Hash chain: chainKey is organizationId, or the literal "PLATFORM" for
+  // events with no organization yet (e.g. registration). sequenceNumber is
+  // monotonic within a chainKey. hash = HMAC-SHA256(AUDIT_SIGNING_KEY,
+  // previousHash + canonical(this row minus hash)). This gives
+  // application-level tamper *detection*: editing a row changes its hash and
+  // breaks the chain for every later row in that chain, and recomputing a
+  // valid replacement chain requires the server's signing key. It is not
+  // independent, write-once storage — a party with DB *and* key access could
+  // still rewrite history. See docs/limitations.md.
+  chainKey       String
+  sequenceNumber Int
+  previousHash   String
+  hash           String   @unique
+
+  @@unique([chainKey, sequenceNumber])
+  @@index([organizationId, timestampUtc])
+  @@index([documentId])
+  @@index([userId])
+}
+
+enum AuditEventType {
+  USER_REGISTERED
+  USER_EMAIL_VERIFIED
+  USER_LOGIN_SUCCESS
+  USER_LOGIN_FAILED
+  USER_LOGOUT
+  USER_MFA_ENROLLED
+  USER_MFA_VERIFIED
+  USER_PASSWORD_CHANGED
+  USER_PASSWORD_RESET
+  USER_ACCOUNT_LOCKED
+  USER_DEACTIVATED
+  USER_REACTIVATED
+  MEMBERSHIP_ROLE_CHANGED
+  MEMBERSHIP_INVITED
+  MEMBERSHIP_PERMISSION_CHANGED
+  ORG_SETTINGS_CHANGED
+  DOCUMENT_UPLOADED
+  DOCUMENT_RENAMED
+  DOCUMENT_VERSION_CREATED
+  DOCUMENT_VIEWED
+  DOCUMENT_DOWNLOADED
+  DOCUMENT_ARCHIVED
+  DOCUMENT_MOVED
+  LEGAL_HOLD_PLACED
+  LEGAL_HOLD_RELEASED
+  SIGNATURE_REQUEST_CREATED
+  SIGNATURE_REQUEST_SENT
+  RECIPIENT_INVITED
+  RECIPIENT_VIEWED_DOCUMENT
+  SIGNATURE_FIELD_COMPLETED
+  SIGNATURE_APPLIED
+  SIGNATURE_REQUEST_COMPLETED
+  SIGNATURE_REQUEST_DECLINED
+  SIGNATURE_REQUEST_VOIDED
+  SIGNATURE_REQUEST_EXPIRED
+  COMPLIANCE_REPORT_GENERATED
+  COMPLIANCE_REPORT_EXPORTED
+  ADMIN_ACTION
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Retention, legal hold, training
+// ─────────────────────────────────────────────────────────────────────────
+
+model RetentionPolicy {
+  id                 String   @id @default(uuid())
+  organizationId     String
+  organization       Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name               String
+  documentCategory   String?
+  retentionPeriodDays Int
+  actionOnExpiry     RetentionAction @default(ARCHIVE)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([organizationId])
+}
+
+enum RetentionAction {
+  ARCHIVE
+  FLAG_FOR_REVIEW
+}
+
+model LegalHold {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  reason         String
+  placedById     String
+  placedAt       DateTime @default(now())
+  releasedAt     DateTime?
+  releasedById   String?
+
+  documents Document[]
+
+  @@index([organizationId])
+}
+
+model TrainingRecord {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courseName     String
+  completedAt    DateTime?
+  expiresAt      DateTime?
+  score          Float?
+  certificateUrl String?
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, userId])
+}
+
+model ComplianceReport {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type           ComplianceReportType
+  generatedById  String
+  generatedBy    User     @relation(fields: [generatedById], references: [id])
+  parameters     Json?
+  storageKey     String?
+  format         ReportFormat @default(PDF)
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, type])
+}
+
+enum ComplianceReportType {
+  DOCUMENT_AUDIT_TRAIL
+  SIGNATURE_HISTORY
+  USER_ACCESS
+  FAILED_AUTHENTICATION
+  DOCUMENT_INTEGRITY
+  ORGANIZATION_ACTIVITY
+  USER_TRAINING
+  SYSTEM_CONFIGURATION_HISTORY
+}
+
+enum ReportFormat {
+  PDF
+  CSV
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Notifications
+// ─────────────────────────────────────────────────────────────────────────
+
+model NotificationPreference {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  eventType      NotificationEventType
+  emailEnabled   Boolean  @default(true)
+
+  @@unique([organizationId, eventType])
+}
+
+enum NotificationEventType {
+  SIGNATURE_REQUEST_RECEIVED
+  SIGNATURE_REMINDER
+  DOCUMENT_COMPLETED
+  DOCUMENT_DECLINED
+  DOCUMENT_EXPIRED
+  ACCOUNT_CREATED
+  PASSWORD_RESET
+  SECURITY_ALERT
+}
+
+model EmailLog {
+  id             String   @id @default(uuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  toEmail        String
+  eventType      NotificationEventType
+  relatedId      String?
+  status         EmailStatus @default(QUEUED)
+  providerMessageId String?
+  error          String?
+  createdAt      DateTime @default(now())
+  sentAt         DateTime?
+
+  @@index([organizationId])
+  @@index([toEmail])
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Billing
+// ─────────────────────────────────────────────────────────────────────────
+
+model SubscriptionPlan {
+  id             String   @id @default(uuid())
+  code           String   @unique // "TRIAL", "STARTER", "PROFESSIONAL", "ENTERPRISE"
+  name           String
+  priceMonthlyCents Int
+  priceAnnualCents  Int
+  usageLimits    Json     // { maxUsers, maxDocumentsPerMonth, maxStorageGb, ... }
+  features       Json
+  active         Boolean  @default(true)
+  // Set by an operator once real Stripe Products/Prices exist for this plan.
+  // Null until then — checkout clearly reports "not connected" rather than
+  // guessing a price id. See src/lib/stripe.ts.
+  stripePriceIdMonthly String?
+  stripePriceIdAnnual  String?
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                   String   @id @default(uuid())
+  organizationId       String   @unique
+  organization         Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  planId               String
+  plan                 SubscriptionPlan @relation(fields: [planId], references: [id])
+  status               SubscriptionStatus @default(TRIALING)
+  billingCycle         BillingCycle @default(MONTHLY)
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  trialEndsAt          DateTime?
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean  @default(false)
+  canceledAt           DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([status])
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+enum BillingCycle {
+  MONTHLY
+  ANNUAL
+}
+
+model BillingRecord {
+  id               String   @id @default(uuid())
+  organizationId   String
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  stripeInvoiceId  String?  @unique
+  amountCents      Int
+  currency         String   @default("usd")
+  status           BillingRecordStatus @default(PENDING)
+  pdfUrl           String?
+  issuedAt         DateTime @default(now())
+  paidAt           DateTime?
+
+  @@index([organizationId])
+}
+
+enum BillingRecordStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
